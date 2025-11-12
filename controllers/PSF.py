@@ -1,5 +1,6 @@
 import numpy as np
 import casadi as ca
+from scipy.spatial import ConvexHull
 
 
 class PSF_Controller:
@@ -10,30 +11,25 @@ class PSF_Controller:
                 control_frequency : float,
                 neural_model,
                 bounds : dict,
-                R: np.ndarray,
+                obstacles = None,
+                backup_policy = None,
+                R = np.diag([1.0, 0.1]),
                 terminal_ingredients=None):
 
         self._N = horizon
         self._dt = 1 / control_frequency
 
-        self._R = R
-
         self._bounds = bounds
 
         self._n_x = 3
         self._n_u = 2
+        self._R = R
 
         self._dynamics = dynamics
-        self.gamma = 0.9
 
         self._neural_model = neural_model
 
-        self.X = ca.MX.sym('X', self._n_x, self._N+1)
-        self.U = ca.MX.sym('U', self._n_u, self._N)
-        self.Z = ca.MX.sym('Z', self._n_x, self._N+1)
-
         self._terminal_ingredients = terminal_ingredients
-        self._previous_action = [0., 0.]
         self._pose = None
         self._velocities = None
         self._target_pose = None
@@ -42,21 +38,28 @@ class PSF_Controller:
 
         self.episode_start = True
 
+        self.obstacles = obstacles if obstacles is not None else []
+
+
 
     def set_target_velocities(self, target_velocities):
         self._target_velocities = target_velocities
+
 
     
     def set_target_pose(self, target_pose):
         self._target_pose = target_pose
 
 
+
     def set_current_pose(self, pose):
         self._pose = pose
 
 
+
     def set_current_velocities(self, velocities):
         self._velocities = velocities
+
 
 
     def rk4_step(self, x, u):
@@ -67,66 +70,8 @@ class PSF_Controller:
         return x + self._dt/6*(k1 + 2*k2 + 2*k3 + k4)
 
 
-    # def _compute_agent_vect(self, action):
-    #     """
-    #     Returns a vector describing:
-    #     - distance to target (rho)
-    #     - direction to target (alpha)
-    #     - orientation error (delta_yaw)
-    #     - error in forward speed
-    #     - error in angular velocity
-    #     """
 
-    #     v_ref, gamma = action
-    #     prev_v_ref, prev_gamma = self._previous_action
-
-    #     diff_v_ref = v_ref - prev_v_ref
-    #     diff_gamma = gamma - prev_gamma
-
-    #     # Agent state
-    #     pose_x, pose_y, pose_yaw = self._pose
-    #     lin_vel, lat_vel, ang_vel = self._velocities
-
-    #     # Target state
-    #     target_x, target_y, target_yaw = self._target_pose
-    #     target_lin_vel, target_ang_vel = self._target_velocities
-
-
-    #     dx = target_x - pose_x
-    #     dy = target_y - pose_y
-
-    #     #forward error in agent space
-    #     forward_error =  np.cos(pose_yaw) * dx + np.sin(pose_yaw) * dy
-
-    #     lateral_error = -np.sin(pose_yaw) * dx + np.cos(pose_yaw) * dy
-        
-    #     #orientation error
-    #     delta_yaw = (target_yaw - pose_yaw + np.pi) % (2 * np.pi) - np.pi
-
-    #     target_vel_robot_frame = np.array([
-    #         target_lin_vel * np.cos(target_yaw - pose_yaw),
-    #         target_lin_vel * np.sin(target_yaw - pose_yaw)
-    #     ])
-
-    #     vel_error_x = target_vel_robot_frame[0] - lin_vel
-    #     vel_error_y = target_vel_robot_frame[1] - lat_vel
-
-    #     ang_vel_error = target_ang_vel - ang_vel
-    
-    #     agent_state_vect = np.array([
-    #         forward_error,
-    #         lateral_error,
-    #         delta_yaw,
-    #         vel_error_x,
-    #         vel_error_y,
-    #         ang_vel_error,
-    #         gamma,
-    #         v_ref
-    #     ])
-
-    #     return agent_state_vect
-
-    def _compute_agent_vect(self, action):
+    def _compute_agent_vect(self):
 
         """
         Returns a vector describing:
@@ -205,28 +150,49 @@ class PSF_Controller:
         return action.tolist()
 
 
-    def build_nlp(self, x_init, u_init):
 
+    def obstacle_to_ellipse(self, points: np.ndarray, safety_radius: float = 0.2):
+
+        assert points.shape[1] == 2, "Les points doivent être en 2D"
+
+        hull = ConvexHull(points)
+        hull_pts = points[hull.vertices]
+
+        center = np.mean(hull_pts, axis=0)
+
+        distances = np.linalg.norm(hull_pts - center, axis=1)
+        max_dist = np.max(distances)
+
+        radius = max_dist + safety_radius
+
+        return {
+            'center': center,
+            'radius': radius
+        }
+
+
+
+    def build_nlp(self, x_init, u_ref, h):
+
+
+        nx, nu = self._n_x, self._n_u
+        X = ca.MX.sym('X', nx, h+1)
+        U = ca.MX.sym('U', nu, h)
 
         cost = 0
-        g_equalities = []
-        g_ineq = []
 
-        #u_ref is u_init during horizon
-        u_ref = np.zeros((2, self._N + 1))
+        for k in range(h):
 
-        for k in range(self._N):
-
-            d_f = self.gamma**k
-            command_error = self.U[:, k] - u_init
-            cost += d_f * ca.mtimes([command_error.T, self._R, command_error])
+            if k == 0:
+                diff = U[:,k] - ca.DM(u_ref)
+                cost += ca.mtimes([diff.T, ca.DM(self._R), diff])
 
 
 
         if self._terminal_ingredients is not None:
 
             P = self._terminal_ingredients["P"]
-            state_error_terminal = self.X[:, self._N] - x_ref[:, int(self._N)]
+            state_error_terminal = X[:, h] - x_ref[:, h]
             alpha = float(self._terminal_ingredients["alpha"])
             quad = ca.mtimes([state_error_terminal.T, ca.DM(P), state_error_terminal])
             g_ineq += [quad - alpha]
@@ -237,14 +203,17 @@ class PSF_Controller:
         # ---------------- Constraints ----------------
 
         # equality constraints : dynamique
+        g_equalities = []
 
-        for k in range(self._N):
-            x_next_pred = self.rk4_step(self.X[:, k], self.U[:, k])
-            g_equalities.append(self.X[:, k+1] - x_next_pred)
+        for k in range(h):
+            x_next_pred = self.rk4_step(X[:, k], U[:, k])
+            g_equalities.append(X[:, k+1] - x_next_pred)
 
         # initial condition
-        g_equalities.append(self.X[:,0] - x_init)
+        g_equalities.append(X[:,0] - x_init)
         g_equalities = ca.vertcat(*g_equalities)
+
+        g_ineq = []
 
         # inequality constraints : bornes
         u_min = self._bounds["u_min"]
@@ -253,32 +222,48 @@ class PSF_Controller:
         x_max = self._bounds["x_max"]
 
 
-        for k in range(self._N):
+        for k in range(h):
 
             for i in range(self._n_u):
-                g_ineq += [u_min[i] - self.U[i, k]]
-                g_ineq += [self.U[i, k] - u_max[i]]
+                g_ineq += [u_min[i] - U[i, k]]
+                g_ineq += [U[i, k] - u_max[i]]
 
 
             for i in range(self._n_x):
-                g_ineq += [x_min[i] - self.X[i, k+1]]
-                g_ineq += [self.X[i, k+1] - x_max[i]]
+                g_ineq += [x_min[i] - X[i, k+1]]
+                g_ineq += [X[i, k+1] - x_max[i]]
+
+
+        for obstacle in self.obstacles:
+            ellipse = self.obstacle_to_ellipse(obstacle, safety_radius=1.0)
+            center = ellipse['center']
+            radius = ellipse['radius']
+
+            for k in range(h+1):
+                dist_sq = (X[0, k] - center[0])**2 + (X[1, k] - center[1])**2
+                g_ineq += [radius**2 - dist_sq]
 
         g_ineq = ca.vertcat(*g_ineq)
 
 
-        opt_vars = ca.vertcat(ca.reshape(self.X, -1, 1),
-                              ca.reshape(self.U, -1, 1),
-                              ca.reshape(self.Z, -1, 1))
+        opt_vars = ca.vertcat(ca.reshape(X, -1, 1),
+                              ca.reshape(U, -1, 1))
 
         nlp = {'x': opt_vars, 'f': cost, 'g': ca.vertcat(g_equalities, g_ineq)}
-        return nlp, g_equalities, g_ineq
+
+        sizes = {
+            'nx_block': nx*(h+1),
+            'nu_block': nu*h,
+            'g_eq_len': g_equalities.numel(),
+            'g_ineq_len': g_ineq.numel(),
+            'horizon': h
+        }
+
+        return nlp, sizes, g_equalities, g_ineq
 
 
-    def solve(self, x_init, u_init):
 
-        nlp, g, g_ineq = self.build_nlp(x_init, u_init)
-
+    def solve_nlp(self, nlp, sizes) : 
 
         opts = {
             "ipopt.print_level": 0,
@@ -288,42 +273,75 @@ class PSF_Controller:
 
         solver = ca.nlpsol('solver', 'ipopt', nlp)
 
-        lbg = [0]*g.numel() + [-ca.inf]*g_ineq.numel()
-        ubg = [0]*g.numel() + [0]*g_ineq.numel()
+        g_eq = sizes['g_eq_len']
+        g_ineq = sizes['g_ineq_len']
+        horizon = sizes['horizon']
 
-        X0 = np.tile(x_init.reshape(-1,1), (1, self._N+1))
-        U0 = np.zeros((self._n_u, self._N))
-        Z0 = np.zeros((self._n_x, self._N+1))
+        lbg = [0]*g_eq + [-ca.inf]*g_ineq
+        ubg = [0]*g_eq + [0]*g_ineq
 
+        X0 = np.tile(x_init.reshape(-1,1), (1, horizon+1))
+        U0 = np.zeros((self._n_u, horizon))
         x_init_tile = X0.flatten(order='F')
         u_init_tile = U0.flatten(order='F')
-        z_init_tile = Z0.flatten(order='F')
 
-        initial_guess = np.concatenate([x_init_tile, u_init_tile, z_init_tile])
+        initial_guess = np.concatenate([x_init_tile, u_init_tile])
 
         sol = solver(x0=initial_guess, lbg=lbg, ubg=ubg)
-        w_opt = np.array(sol['x']).squeeze()
 
-        X_opt = w_opt[:self._n_x*(self._N+1)].reshape((self._n_x, self._N+1), order='F')
-        U_opt = w_opt[self._n_x*(self._N+1):self._n_x*(self._N+1)+self._n_u*self._N].reshape((self._n_u, self._N), order='F')
+        stats = solver.stats()
+        if not stats['success']:
+            print("NLP solver failed")
+            return None, None   
+
+        else : 
+            w_opt = np.array(sol['x']).squeeze()
+            X_opt = w_opt[:self._n_x*(horizon+1)].reshape((self._n_x, horizon+1), order='F')
+            U_opt = w_opt[self._n_x*(horizon+1):self._n_x*(horizon+1)+self._n_u*horizon].reshape((self._n_u, horizon), order='F')
+
+            return X_opt, U_opt
+
+
+
+    def solve_global_problem(self, x_init, u_rl) :
+
+        x_init = np.array(x_init).reshape(-1)
+        u_rl = np.array(u_rl).reshape(-1)
+
+        feasible = False
+        X_opt = None
+        U_opt = None
+
+        # unascendant horizon search
+
+        for h in range(self._N, 0, -1):
+            nlp, sizes, g_equalities, g_ineq = self.build_nlp(x_init, u_rl, h)
+            X_opt, U_opt = self.solve_nlp(nlp, sizes)
+
+            if X_opt is not None and U_opt is not None:
+                return X_opt, U_opt
+
+        X_opt = x_init.reshape(-1, 1)  
+        U_opt = np.zeros((self._n_u, 1))   
 
         return X_opt, U_opt
 
 
+
     def act(self, x_init) :
 
-        obs = self._compute_agent_vect(self._previous_action)
+        obs = self._compute_agent_vect()
         u_init = self.get_neural_prediction(obs)[0]
         print("Neural action:", u_init)
 
         v_ref, gamma = u_init
         u_init = np.array([v_ref, (gamma)])
-        self._previous_action = [v_ref, gamma]
 
-        X_opt, U_opt = self.solve(x_init, u_init)
+        X_opt, U_opt = self.solve_global_problem(x_init, u_init)
         opt_cmd = U_opt[:, 0]
 
         return opt_cmd
+
 
 
 if __name__ == "__main__":
@@ -378,7 +396,7 @@ if __name__ == "__main__":
 
     low_level_control_params = {'zeta_gamma': 0.4874,
                                             'omega_n_gamma': 1.8471,
-                                            'gamma_0': -0.0260,
+                                            'gamma_0': 0.,
                                             'tau_gamma': 0.25,
                                             'zeta_v': 0.8,
                                             'omega_n_v': 0.5642,
@@ -390,42 +408,18 @@ if __name__ == "__main__":
                                             'lambda_decay': 0.1}
 
 
-    # def f_dyn(x, u):
-
-    #     Lf = 1.775
-    #     Lr = 1.775
-
-    #     xf, yf, thetaf, gammaf = x[0], x[1], x[2], x[3]
-    #     v, w = u[0], u[1]
-    #     xf_dot = v * ca.cos(thetaf)
-    #     yf_dot = v * ca.sin(thetaf)
-    #     thetaf_dot = (v * ca.sin(gammaf)) / (Lf * ca.cos(gammaf) + Lr) + (w * Lr) / (Lf * ca.cos(gammaf) + Lr)
-    #     gammaf_dot = w
-    #     return ca.vertcat(xf_dot, yf_dot, thetaf_dot, gammaf_dot)
-
-
     def f_dyn(x, u):
         Lf = 1.775
         Lr = 1.775
 
-        # États : position et orientation
         xf, yf, thetaf = x[0], x[1], x[2]
-        # Commandes : vitesse longitudinale et angle de braquage
         v, gamma = u[0], u[1]
 
-        # Équations du modèle cinématique bicycle
         xf_dot = v * ca.cos(thetaf)
         yf_dot = v * ca.sin(thetaf)
         thetaf_dot = v * ca.tan(gamma) / (Lf + Lr)
 
-        # Pas de gamma_dot car gamma est une entrée
         return ca.vertcat(xf_dot, yf_dot, thetaf_dot)
-
-
-    horizon = 10
-    control_frequency = 4
-
-    big = 1e7
 
     bounds = {
             "u_min" : [-3.0, -0.65], # vmin, gammapmin
@@ -434,39 +428,33 @@ if __name__ == "__main__":
             "x_max" : [75.6, 680.2, np.pi]  #xmax, ymax, thetamax, gammamax
     }
 
-    Q = np.diag([50., 50., 25.0, 1.0]) # State cost
-    R = np.diag([1.0, 1.0])       # Control cost
+    R = np.diag([1.0, 1.0])  # Control cost
+
+    obstacles = [np.array([
+            [60., 575.000],
+            [60., 565.0],
+            [50., 565.0],
+            [50., 575.0],
+        ])]
 
     init_pose = np.array([51.0, 545.2, np.pi/4])
     final_pose = np.array([55.6, 599.4, np.pi/2])
 
-    P =  np.array([[ 2.63159653e+00, -3.25449411e-11, -6.85308646e-13, 7.77634983e-14],
-                [-3.25449411e-11,  2.63159653e+00,  8.90434150e-11, 3.83249971e-13],
-                [-6.85308646e-13,  8.90434150e-11,  6.57832447e+00, -1.58190901e-12],
-                [ 7.77634983e-14,  3.83249971e-13, -1.58190901e-12, 2.63158332e-01]])
+    multi_dir_path = navigation_planner.generate_path(
+            init_pose,
+            final_pose
+        )
 
-    K =  np.array([[ 1.83129401e-23, -1.50241861e-12, -2.30867271e-13, -2.42484766e-15],
-                [1.57799262e-14, -1.72072896e-13, -1.78946189e-13, -1.10481972e-14]])
-
-    alpha = 0.25
-
-    #terminal_ingredients = {"P": P, "K": K, "alpha": alpha}
-    terminal_ingredients = None
+    horizon = 10
+    control_frequency = 4.0
 
     PSF = PSF_Controller(dynamics=f_dyn,
         horizon = horizon,
         control_frequency = control_frequency,
         neural_model = PPO.load(lstm_model_path),
         bounds = bounds,
+        obstacles = obstacles,
         R = R)
-
-    add_terminal_ellipse = False
-
-
-    multi_dir_path = navigation_planner.generate_path(
-            init_pose,
-            final_pose
-        )
 
     trajs = []
 
@@ -505,9 +493,8 @@ if __name__ == "__main__":
 
     Y = model.output_function(X_k, W_k)
 
-    gs = Y['gs']
+    gs = X_k['gf']
     ang_vel = Y['ang_vel']
-    lat_vel = Y['lat_vel']
     lin_vel = Y['lin_vel']
 
     pose_x, pose_y, pose_yaw = se2.se2_to_vec(gs)
@@ -525,6 +512,7 @@ if __name__ == "__main__":
     dt = 1 / control_frequency
 
     for traj in trajs:
+        
         t = 0.0
         traj_duration = traj.get_temporal_law().get_duration()
 
@@ -551,9 +539,8 @@ if __name__ == "__main__":
 
             Y = model.output_function(X_k, W_k)
 
-            gs = Y['gs']
+            gs = X_k['gf']
             ang_vel = Y['ang_vel']
-            lat_vel = Y['lat_vel']
             lin_vel = Y['lin_vel']
 
             pose_x, pose_y, pose_yaw = se2.se2_to_vec(gs)
@@ -576,8 +563,6 @@ if __name__ == "__main__":
             # Avancer le temps
             t += dt
 
-
-
     ax = project.visualize(show=False)  # ax de la carte
     ax.set_xlabel('X position')
     ax.set_ylabel('Y position')
@@ -589,6 +574,29 @@ if __name__ == "__main__":
     trajectory_line, = ax.plot([], [], '-b', label='Trajectory')
     target_line, = ax.plot([], [], '-g', label='Target')
 
+    ellipse = PSF.obstacle_to_ellipse(obstacles[0], safety_radius=1.0)
+
+    # Dessiner les obstacles
+    for obs in obstacles:
+        polygon = plt.Polygon(obs, color='gray')
+        ax.add_patch(polygon)
+
+    # plot ellipse
+    if ellipse is not None:
+        center = ellipse['center']
+        radius = ellipse['radius']
+
+        terminal_patch = Ellipse(
+            xy=center,
+            width=2*radius,
+            height=2*radius,
+            angle=0,
+            edgecolor='r',
+            facecolor='none',
+            linestyle='--',
+            label='TObstacle ellipse'
+        )
+        ax.add_patch(terminal_patch)
 
     add_terminal_ellipse = False
 
