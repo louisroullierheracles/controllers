@@ -3,6 +3,28 @@ import casadi as ca
 from scipy.spatial import ConvexHull
 
 
+def convex_hull_distance(poly, x):
+    """
+    poly : (N,2) polygone convexe en CCW
+    x    : MX(2)
+    return: distance signée d(x, poly)  = max_i d_i(x)
+    """
+    N = poly.shape[0]
+    d = -1e9  # -inf
+    
+    for i in range(N):
+        p_i = poly[i]
+        p_j = poly[(i+1) % N]
+
+        e = p_j - p_i
+        n = np.array([e[1], -e[0]])  # outward normal
+
+        d_i = ca.dot(x - p_i, n) / np.linalg.norm(n)
+        d = ca.fmax(d, d_i)
+
+    return d
+
+
 class PSF_Controller:
 
     def __init__(self,
@@ -40,6 +62,7 @@ class PSF_Controller:
 
         self.obstacles = obstacles if obstacles is not None else []
 
+        self.backup_policy = backup_policy
 
 
     def set_target_velocities(self, target_velocities):
@@ -181,13 +204,17 @@ class PSF_Controller:
 
         cost = 0
 
+        # diff_rl = U[:,0] - ca.DM(u_ref)
+        # cost += ca.mtimes([diff_rl.T, ca.DM(self._R), diff_rl])
+
+        #penalize variations in control
         for k in range(h):
 
-            if k == 0:
-                diff = U[:,k] - ca.DM(u_ref)
-                cost += ca.mtimes([diff.T, ca.DM(self._R), diff])
+            diff_rl = U[:,k] - ca.DM(u_ref)
+            cost += ca.mtimes([diff_rl.T, ca.DM(self._R), diff_rl])
 
-
+            # diff = U[:,k] - U[:,k-1]
+            # cost += ca.mtimes([diff.T, ca.DM(self._R), diff])
 
         if self._terminal_ingredients is not None:
 
@@ -207,6 +234,8 @@ class PSF_Controller:
 
         for k in range(h):
             x_next_pred = self.rk4_step(X[:, k], U[:, k])
+            # theta should be wrapped between -pi and pi
+            x_next_pred[2] = ca.fmod(x_next_pred[2] + ca.pi, 2 * ca.pi) - ca.pi
             g_equalities.append(X[:, k+1] - x_next_pred)
 
         # initial condition
@@ -271,7 +300,7 @@ class PSF_Controller:
             "ipopt.sb": "yes",
         }
 
-        solver = ca.nlpsol('solver', 'ipopt', nlp)
+        solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
 
         g_eq = sizes['g_eq_len']
         g_ineq = sizes['g_ineq_len']
@@ -302,7 +331,6 @@ class PSF_Controller:
             return X_opt, U_opt
 
 
-
     def solve_global_problem(self, x_init, u_rl) :
 
         x_init = np.array(x_init).reshape(-1)
@@ -321,8 +349,12 @@ class PSF_Controller:
             if X_opt is not None and U_opt is not None:
                 return X_opt, U_opt
 
-        X_opt = x_init.reshape(-1, 1)  
-        U_opt = np.zeros((self._n_u, 1))   
+        X_opt = x_init.reshape(-1, 1) 
+        if self.backup_policy is not None :
+            U_opt = self.backup_policy.act(x_init)
+            U_opt = U_opt.reshape(-1, 1)
+        else :
+            U_opt = np.zeros((self._n_u, 1))
 
         return X_opt, U_opt
 
@@ -335,12 +367,12 @@ class PSF_Controller:
         print("Neural action:", u_init)
 
         v_ref, gamma = u_init
-        u_init = np.array([v_ref, (gamma)])
+        u_init = np.array([v_ref, gamma])
 
         X_opt, U_opt = self.solve_global_problem(x_init, u_init)
         opt_cmd = U_opt[:, 0]
 
-        return opt_cmd
+        return opt_cmd, u_init, X_opt
 
 
 
@@ -349,6 +381,7 @@ if __name__ == "__main__":
 
     import random
     import time
+    import csv
     import matplotlib.pyplot as plt
     from matplotlib.animation import FuncAnimation
     from matplotlib.patches import Ellipse
@@ -356,6 +389,7 @@ if __name__ == "__main__":
     from sb3_contrib import RecurrentPPO
     from stable_baselines3 import PPO
 
+    from backup_policy import Backup_Policy
 
     from heracles_planning.paths.path_spiral import Path_Spiral
     from heracles_planning.paths.path_pose import Path_Pose
@@ -430,12 +464,16 @@ if __name__ == "__main__":
 
     R = np.diag([1.0, 1.0])  # Control cost
 
-    obstacles = [np.array([
-            [60., 575.000],
-            [60., 565.0],
-            [50., 565.0],
-            [50., 575.0],
-        ])]
+
+    obstacles = [
+            np.array([
+                [60., 570.000],
+                [60., 565.0],
+                [55., 565.0],
+                [55., 570.0],
+            ])
+    ]
+
 
     init_pose = np.array([51.0, 545.2, np.pi/4])
     final_pose = np.array([55.6, 599.4, np.pi/2])
@@ -445,16 +483,21 @@ if __name__ == "__main__":
             final_pose
         )
 
-    horizon = 10
+    horizon = 15
     control_frequency = 4.0
 
-    PSF = PSF_Controller(dynamics=f_dyn,
-        horizon = horizon,
-        control_frequency = control_frequency,
-        neural_model = PPO.load(lstm_model_path),
-        bounds = bounds,
-        obstacles = obstacles,
-        R = R)
+
+    PSF = PSF_Controller(
+        dynamics=f_dyn,
+        horizon=horizon,
+        control_frequency=control_frequency,
+        neural_model=PPO.load(lstm_model_path),
+        bounds=bounds,
+        obstacles=obstacles,
+        backup_policy=None,
+        R=R
+    )
+
 
     trajs = []
 
@@ -506,62 +549,110 @@ if __name__ == "__main__":
 
     target_x = []
     target_y = []
+    u_psf = []
+    u_drl = []
 
-    prev_v, prev_gamma = 0., 0.
-
+    black_states_index = []
     dt = 1 / control_frequency
 
-    for traj in trajs:
-        
-        t = 0.0
-        traj_duration = traj.get_temporal_law().get_duration()
+    with open("psf_log.csv", "w", newline="") as f:
 
-        while t < traj_duration:
+        writer = csv.writer(f)
+        header = ["step", "x", "y", "theta", "v_ref_drl", "gamma_cmd_drl"]
+        for i in range(horizon):
+            #write each element of X_opt "
+            header += [f"x_opt_{i}", f"y_opt_{i}", f"theta_opt_{i}"]
+        header += ["black_state"]
+        writer.writerow(header)
 
-            v, w, x, y, yaw = traj(t)
+        for traj in trajs:
+            
+            t = 0.0
+            i = 0
+            traj_duration = traj.get_temporal_law().get_duration()
 
-            PSF.set_current_velocities([lin_vel,  ang_vel])
-            PSF.set_current_pose([pose_x, pose_y, pose_yaw])
-            PSF.set_target_pose([x, y, yaw])
-            PSF.set_target_velocities([v, w])
+            while t < traj_duration:
 
-            x_init = np.array([x, y, yaw])
-            u_ref = [prev_v, prev_gamma]
+                v, w, x, y, yaw = traj(t)
 
-            u = PSF.act(x_init)
-            v_ref, gamma_cmd = u
+                PSF.set_current_velocities([lin_vel,  ang_vel])
+                PSF.set_current_pose([pose_x, pose_y, pose_yaw])
+                PSF.set_target_pose([x, y, yaw])
+                PSF.set_target_velocities([v, w])
 
-            U_k = {'vf_ref': v_ref, 'gamma_cmd': gamma_cmd}
+                x_init = np.array([pose_x, pose_y, pose_yaw])
 
-            X_k = model._simulate(X_k, U_k, W_k, low_level_control_params)
+                u, u_init, X_opt = PSF.act(x_init)
+                v_ref, gamma_cmd = u
 
-            # Récupération des poses pour affichage
+                u_psf.append([v_ref, gamma_cmd])
+                u_drl.append(u_init)
+                if not np.allclose(u, u_init, atol=1e-2):
+                    black_states_index.append(i)
 
-            Y = model.output_function(X_k, W_k)
+                U_k = {'vf_ref': v_ref, 'gamma_cmd': gamma_cmd}
 
-            gs = X_k['gf']
-            ang_vel = Y['ang_vel']
-            lin_vel = Y['lin_vel']
+                X_k = model._simulate(X_k, U_k, W_k, low_level_control_params)
 
-            pose_x, pose_y, pose_yaw = se2.se2_to_vec(gs)
-            gamma = X_k["gamma"]
+                # Récupération des poses pour affichage
 
-            X_poses.append(pose_x)
-            Y_poses.append(pose_y)
-            target_x.append(x)
-            target_y.append(y)
+                Y = model.output_function(X_k, W_k)
 
-            x_next = np.array([pose_x, pose_y, pose_yaw])
+                gs = X_k['gf']
+                ang_vel = Y['ang_vel']
+                lin_vel = Y['lin_vel']
+
+                pose_x, pose_y, pose_yaw = se2.se2_to_vec(gs)
+                gamma = X_k["gamma"]
+
+                X_poses.append(pose_x)
+                Y_poses.append(pose_y)
+                target_x.append(x)
+                target_y.append(y)
+
+                x_next = np.array([pose_x, pose_y, pose_yaw])
 
 
-            # Mise à jour de l'état initial pour le prochain pas
-            x_init = x_next
+                # Mise à jour de l'état initial pour le prochain pas
+                x_init = x_next
 
-            u_ref = [v_ref, gamma_cmd]
-            prev_v, prev_gamma = v_ref, gamma_cmd
+                u_ref = [v_ref, gamma_cmd]
+                row = [i, pose_x, pose_y, pose_yaw, u_init[0], u_init[1]]
 
-            # Avancer le temps
-            t += dt
+                for k in range(horizon):
+                    if X_opt is not None:
+                        row += [X_opt[0, k], X_opt[1, k], X_opt[2, k]] 
+                    else:
+                        row += [0.0, 0.0, 0.0]
+                row += [1 if i in black_states_index else 0]
+
+                writer.writerow(row)
+
+                # Avancer le temps
+                t += dt
+                i += 1
+
+
+    # compare u_psf and u_drl
+    u_psf = np.array(u_psf)
+    u_drl = np.array(u_drl)
+    time_steps = np.arange(u_psf.shape[0]) * dt
+    plt.figure()
+    plt.subplot(2,1,1)
+    plt.plot(time_steps, u_psf[:,0], label='PSF v')
+    plt.plot(time_steps, u_drl[:,0], label='DRL v', linestyle='--')
+    plt.ylabel('Linear Velocity (m/s)')
+    plt.legend()
+    plt.subplot(2,1,2)
+    plt.plot(time_steps, u_psf[:,1], label='PSF gamma')
+    plt.plot(time_steps, u_drl[:,1], label='DRL gamma', linestyle='--')
+    plt.ylabel('Steering Angle (rad)')
+    plt.xlabel('Time (s)')
+    plt.legend()
+    plt.suptitle('Control Inputs Comparison')
+    plt.show()
+
+
 
     ax = project.visualize(show=False)  # ax de la carte
     ax.set_xlabel('X position')
@@ -574,7 +665,8 @@ if __name__ == "__main__":
     trajectory_line, = ax.plot([], [], '-b', label='Trajectory')
     target_line, = ax.plot([], [], '-g', label='Target')
 
-    ellipse = PSF.obstacle_to_ellipse(obstacles[0], safety_radius=1.0)
+
+    ellipse = PSF.obstacle_to_ellipse(obstacles[0], safety_radius=0.2)
 
     # Dessiner les obstacles
     for obs in obstacles:
@@ -598,24 +690,34 @@ if __name__ == "__main__":
         )
         ax.add_patch(terminal_patch)
 
-    add_terminal_ellipse = False
+    ax.relim()
+    ax.autoscale_view()
 
+    # Fixer les limites après avoir tout dessiné pour récupérer les bonnes bornes
+    x_min, x_max = ax.get_xlim()
+    y_min, y_max = ax.get_ylim()
+
+    # Créer le cercle en haut à gauche (après avoir les limites correctes)
+    psf_indicator_radius = 1
+    psf_indicator = plt.Circle(
+        (x_min , y_max - psf_indicator_radius*2),
+        psf_indicator_radius,
+        color='black',
+        visible=False
+    )
+    ax.add_patch(psf_indicator)
     ax.legend()
 
-    # Fonction d'animation
+    # === Fonction d’animation ===
     def animate(i):
         trajectory_line.set_data(X_poses[:i+1], Y_poses[:i+1])
         target_line.set_data(target_x[:i+1], target_y[:i+1])
 
-        if add_terminal_ellipse:
+        # Activation du cercle noir quand le PSF est actif
+        psf_indicator.set_visible(i in black_states_index)
 
-            if i < len(target_x):
-                center = [target_x[i], target_y[i]]
-                terminal_patch.set_center(center)
-
-            return trajectory_line, target_line, terminal_patch
-
-        return trajectory_line, target_line
+        # Important : inclure le cercle dans les objets retournés
+        return trajectory_line, target_line, psf_indicator
 
     # Création de l'animation
     dt = 1 / control_frequency  # secondes
