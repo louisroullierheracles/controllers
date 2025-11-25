@@ -16,6 +16,7 @@ class DRL_Controller:
 
         self.neural_states = None
         self.episode_start = True
+        self._gamma = 0.0
 
 
     def set_target_velocities(self, target_velocities):
@@ -33,6 +34,9 @@ class DRL_Controller:
     def set_current_velocities(self, velocities):
         self._velocities = velocities
 
+
+    def set_gamma(self, gamma):
+        self._gamma = gamma
 
 
     def _compute_agent_vect(self, action):
@@ -82,7 +86,7 @@ class DRL_Controller:
 
         ang_vel_error = target_ang_vel - ang_vel
 
-        current_gamma = 0.
+        current_gamma = self._gamma
         if np.abs(target_ang_vel) < 1e-2 or np.abs(target_lin_vel) < 1e-2: 
             target_gamma = 0.0
         else :  
@@ -271,6 +275,7 @@ if __name__ == "__main__":
             v_ref, gamma_cmd = u
 
             U_k = {'vf_ref': v_ref, 'gamma_cmd': gamma_cmd}
+            DRL.set_gamma(gamma_cmd)
 
             print(U_k)
 
