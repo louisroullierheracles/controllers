@@ -1,6 +1,6 @@
 import numpy as np
 import casadi as ca
-
+from scipy.spatial import ConvexHull
 
 class MPC_Controller:
 
@@ -11,18 +11,19 @@ class MPC_Controller:
                 bounds : dict,
                 Q: np.ndarray,
                 R: np.ndarray,
+                obstacles = None,
                 terminal_ingredients=None):
 
         self._N = horizon
         self._dt = 1 / control_frequency
 
         self._Q = Q
-        self._Qi = np.diag([1.0, 1.0, 1.0, 1.0])
+        self._Qi = np.diag([1.0, 1.0, 1.0])
         self._R = R
 
         self._bounds = bounds
 
-        self._n_x = 4
+        self._n_x = 3
         self._n_u = 2
 
         self.gamma = 0.95
@@ -33,8 +34,13 @@ class MPC_Controller:
         self.U = ca.MX.sym('U', self._n_u, self._N)
         self.Z = ca.MX.sym('Z', self._n_x, self._N+1)
 
+        self.obstacles = obstacles if obstacles is not None else []
+
         self._terminal_ingredients = terminal_ingredients
 
+
+    def set_obstacles(self, obstacles):
+        self.obstacles = obstacles
 
 
     def rk4_step(self, x, u):
@@ -43,6 +49,28 @@ class MPC_Controller:
         k3 = self._dynamics(x + self._dt/2*k2, u)
         k4 = self._dynamics(x + self._dt*k3, u)
         return x + self._dt/6*(k1 + 2*k2 + 2*k3 + k4)
+
+
+
+    def obstacle_to_ellipse(self, points: np.ndarray, safety_radius: float = 1.0):
+
+        assert points.shape[1] == 2, "Les points doivent être en 2D"
+
+        hull = ConvexHull(points)
+        hull_pts = points[hull.vertices]
+
+        center = np.mean(hull_pts, axis=0)
+
+        distances = np.linalg.norm(hull_pts - center, axis=1)
+        max_dist = np.max(distances)
+
+        radius = max_dist + safety_radius
+
+        return {
+            'center': center,
+            'radius': radius
+        }
+
 
 
     def build_nlp(self, x_init, x_ref, u_ref):
@@ -58,13 +86,14 @@ class MPC_Controller:
 
             dx = self.X[0, k] - x_ref[0, k]
             dy = self.X[1, k] - x_ref[1, k]
-            dtheta = ca.fmod(self.X[2, k] - x_ref[2, k] + ca.pi, 2*ca.pi) - ca.pi
 
-            theta_k = self.X[2, k]
+            theta = self.X[2, k]
+            theta_k = ca.fmod(theta + ca.pi, 2*ca.pi) - ca.pi
             e_long =  ca.cos(theta_k)*dx + ca.sin(theta_k)*dy
             e_lat  = -ca.sin(theta_k)*dx + ca.cos(theta_k)*dy
+            dtheta = theta_k - x_ref[2, k]
 
-            state_error_body = ca.vertcat(e_long, e_lat, dtheta, self.X[3,k] - x_ref[3,k])
+            state_error_body = ca.vertcat(e_long, e_lat, dtheta)
 
             d_f = self.gamma**k
             if u_ref is not None:
@@ -118,10 +147,21 @@ class MPC_Controller:
                 g_ineq += [u_min[i] - self.U[i, k]]
                 g_ineq += [self.U[i, k] - u_max[i]]
 
+        for k in range(self._N + 1):
 
             for i in range(self._n_x):
-                g_ineq += [x_min[i] - self.X[i, k+1]]
-                g_ineq += [self.X[i, k+1] - x_max[i]]
+                g_ineq += [x_min[i] - self.X[i, k]]
+                g_ineq += [self.X[i, k] - x_max[i]]
+
+        for obstacle in self.obstacles:
+            ellipse = self.obstacle_to_ellipse(obstacle, safety_radius=1.0)
+            center = ellipse['center']
+            radius = ellipse['radius']
+
+            for k in range(self._N + 1):
+                dist_sq = (self.X[0, k] - center[0])**2 + (self.X[1, k] - center[1])**2
+                g_ineq += [radius**2 - dist_sq]
+
 
         g_ineq = ca.vertcat(*g_ineq)
 
@@ -236,7 +276,7 @@ if __name__ == "__main__":
         return ca.vertcat(xf_dot, yf_dot, thetaf_dot, gammaf_dot)
 
 
-    horizon = 10
+    horizon = 15
     control_frequency = 20
 
     big = 1e7
@@ -266,11 +306,20 @@ if __name__ == "__main__":
 
     terminal_ingredients = {"P": P, "K": K, "alpha": alpha}
 
+    obstacles = [
+            np.array([
+                [58.5, 570.000],
+                [58.5, 565.0],
+                [53., 565.0],
+                [53., 570.0],
+            ])
+    ]
+
     MPC = MPC_Controller(dynamics=f_dyn,
     horizon = horizon,
     control_frequency = control_frequency,
     bounds = bounds,
-    #terminal_ingredients = terminal_ingredients,
+    obstacles = obstacles,
     Q = Q,
     R = R)
 
@@ -348,7 +397,7 @@ if __name__ == "__main__":
         while t < traj_duration:
 
             # ---------------- Construction de l'horizon ----------------
-            x_ref = np.zeros((4, horizon + 1)) 
+            x_ref = np.zeros((3, horizon + 1)) 
             u_ref = np.zeros((2, horizon + 1))
 
             for k in range(horizon + 1):
@@ -364,10 +413,8 @@ if __name__ == "__main__":
                 # Stocker les références
 
 
-                x_ref[:, k] = np.array([x, y, yaw, 0.0])
-                u_ref[:, k] = np.array([v, w])
+                x_ref[:, k] = np.array([x, y, yaw])
 
-                # Stocker la trajectoire cible (pour affichage)
                 if k == 0:
                     target_x.append(x)
                     target_y.append(y)
