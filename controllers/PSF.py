@@ -63,6 +63,9 @@ class PSF_Controller:
         self.obstacles = obstacles if obstacles is not None else []
 
         self.backup_policy = backup_policy
+        self._kbar = None
+        self._X_plan = None
+        self._U_plan = None
 
 
     def set_target_velocities(self, target_velocities):
@@ -78,7 +81,8 @@ class PSF_Controller:
     def set_current_pose(self, pose):
         self._pose = pose
 
-
+    def set_gamma(self, gamma):
+        self._gamma = gamma
 
     def set_current_velocities(self, velocities):
         self._velocities = velocities
@@ -87,10 +91,10 @@ class PSF_Controller:
 
     def rk4_step(self, x, u):
         k1 = self._dynamics(x, u)
-        k2 = self._dynamics(x + self._dt/2*k1, u)
-        k3 = self._dynamics(x + self._dt/2*k2, u)
+        k2 = self._dynamics(x + (self._dt/2)*k1, u)
+        k3 = self._dynamics(x + (self._dt/2)*k2, u)
         k4 = self._dynamics(x + self._dt*k3, u)
-        return x + self._dt/6*(k1 + 2*k2 + 2*k3 + k4)
+        return x + (self._dt/6)*(k1 + 2*k2 + 2*k3 + k4)
 
 
 
@@ -139,13 +143,12 @@ class PSF_Controller:
 
         vel_error_x = target_vel_robot_frame[0] - lin_vel
 
-        ang_vel_error = target_ang_vel - ang_vel
+        current_gamma = self._gamma
 
-        current_gamma = 0.
-        if np.abs(target_ang_vel) < 1e-2 or np.abs(target_lin_vel) < 1e-2: 
+        if np.abs(target_ang_vel) < 1e-5 or np.abs(target_lin_vel) < 1e-5: 
             target_gamma = 0.0
         else :  
-            ratio = np.clip((4 * target_ang_vel) / (2 * target_lin_vel), -1.0, 1.0)
+            ratio = np.clip((4.0 * target_ang_vel) / (2 * target_lin_vel), -1.0, 1.0)
             target_gamma = 2 * np.arcsin(ratio)
 
         gamma_error = target_gamma - current_gamma
@@ -174,7 +177,7 @@ class PSF_Controller:
 
 
 
-    def obstacle_to_ellipse(self, points: np.ndarray, safety_radius: float = 0.2):
+    def obstacle_to_ellipse(self, points: np.ndarray, safety_radius: float = 1.0):
 
         assert points.shape[1] == 2, "Les points doivent être en 2D"
 
@@ -204,17 +207,17 @@ class PSF_Controller:
 
         cost = 0
 
-        # diff_rl = U[:,0] - ca.DM(u_ref)
-        # cost += ca.mtimes([diff_rl.T, ca.DM(self._R), diff_rl])
+        diff_rl = U[:,0] - ca.DM(u_ref)
+        cost += ca.mtimes([diff_rl.T, ca.DM(self._R), diff_rl])
 
-        #penalize variations in control
-        for k in range(h):
+        # #penalize variations in control
+        # for k in range(h):
 
-            diff_rl = U[:,k] - ca.DM(u_ref)
-            cost += ca.mtimes([diff_rl.T, ca.DM(self._R), diff_rl])
+        #     diff_rl = U[:,k] - ca.DM(u_ref)
+        #     cost += ca.mtimes([diff_rl.T, ca.DM(self._R), diff_rl])
 
-            # diff = U[:,k] - U[:,k-1]
-            # cost += ca.mtimes([diff.T, ca.DM(self._R), diff])
+        #     # diff = U[:,k] - U[:,k-1]
+        #     # cost += ca.mtimes([diff.T, ca.DM(self._R), diff])
 
         if self._terminal_ingredients is not None:
 
@@ -292,7 +295,7 @@ class PSF_Controller:
 
 
 
-    def solve_nlp(self, nlp, sizes) : 
+    def solve_nlp(self, nlp, sizes, x_init) : 
 
         opts = {
             "ipopt.print_level": 0,
@@ -344,12 +347,12 @@ class PSF_Controller:
 
         for h in range(self._N, 0, -1):
             nlp, sizes, g_equalities, g_ineq = self.build_nlp(x_init, u_rl, h)
-            X_opt, U_opt = self.solve_nlp(nlp, sizes)
+            X_opt, U_opt = self.solve_nlp(nlp, sizes, x_init)
 
             if X_opt is not None and U_opt is not None:
                 return X_opt, U_opt
 
-        X_opt = x_init.reshape(-1, 1) 
+        X_opt = x_init.reshape(-1, 1).repeat(self._N, axis=1)
         if self.backup_policy is not None :
             U_opt = self.backup_policy.act(x_init)
             U_opt = U_opt.reshape(-1, 1)
@@ -447,6 +450,7 @@ if __name__ == "__main__":
         Lr = 1.775
 
         xf, yf, thetaf = x[0], x[1], x[2]
+        thetaf = (thetaf + np.pi) % (2 * np.pi) - np.pi
         v, gamma = u[0], u[1]
 
         xf_dot = v * ca.cos(thetaf)
@@ -458,8 +462,8 @@ if __name__ == "__main__":
     bounds = {
             "u_min" : [-3.0, -0.65], # vmin, gammapmin
             "u_max" : [3.0, 0.65], # vmax, gammapmax
-            "x_min" : [31.0, 545.2, -np.pi], #xmin, ymin, thetamin, gammamin
-            "x_max" : [75.6, 680.2, np.pi]  #xmax, ymax, thetamax, gammamax
+            "x_min" : [21.0, 535.2, -np.pi], #xmin, ymin, thetamin, gammamin
+            "x_max" : [95.6, 680.2, np.pi]  #xmax, ymax, thetamax, gammamax
     }
 
     R = np.diag([1.0, 1.0])  # Control cost
@@ -467,10 +471,10 @@ if __name__ == "__main__":
 
     obstacles = [
             np.array([
-                [60., 570.000],
-                [60., 565.0],
-                [55., 565.0],
-                [55., 570.0],
+                [57., 570.000],
+                [57., 565.0],
+                [52., 565.0],
+                [52., 570.0],
             ])
     ]
 
@@ -483,7 +487,7 @@ if __name__ == "__main__":
             final_pose
         )
 
-    horizon = 15
+    horizon = 18
     control_frequency = 4.0
 
 
@@ -542,7 +546,7 @@ if __name__ == "__main__":
 
     pose_x, pose_y, pose_yaw = se2.se2_to_vec(gs)
     gamma = X_k["gamma"]
-
+    gamma_cmd = 0.0
 
     X_poses = []
     Y_poses = []
@@ -577,6 +581,7 @@ if __name__ == "__main__":
 
                 PSF.set_current_velocities([lin_vel,  ang_vel])
                 PSF.set_current_pose([pose_x, pose_y, pose_yaw])
+                PSF.set_gamma(gamma_cmd)
                 PSF.set_target_pose([x, y, yaw])
                 PSF.set_target_velocities([v, w])
 
@@ -666,7 +671,7 @@ if __name__ == "__main__":
     target_line, = ax.plot([], [], '-g', label='Target')
 
 
-    ellipse = PSF.obstacle_to_ellipse(obstacles[0], safety_radius=0.2)
+    ellipse = PSF.obstacle_to_ellipse(obstacles[0], safety_radius=1.0)
 
     # Dessiner les obstacles
     for obs in obstacles:
