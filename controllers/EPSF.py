@@ -1,6 +1,8 @@
 import numpy as np
 import casadi as ca
 from scipy.spatial import ConvexHull
+from stable_baselines3 import PPO
+
 
 
 class EPSF_Controller:
@@ -9,13 +11,14 @@ class EPSF_Controller:
                 dynamics,
                 horizon : int,
                 control_frequency : float,
-                neural_model,
+                neural_model_path,
                 bounds : dict,
                 obstacles = None,
                 backup_policy = None,
                 R = np.diag([1.0, 0.1]),
                 Q = np.diag([1.0, 1.0, 1.0, 0.0, 0.0]),
                 diff_R = np.diag([0.1, 0.1]),
+                PR = np.diag([0.0, 0.0]),
                 terminal_ingredients=None):
 
 
@@ -28,10 +31,12 @@ class EPSF_Controller:
         self._n_u = 2
         self._R = R
         self._diff_R = diff_R
+        self._PR = PR
 
         self._dynamics = dynamics
 
-        self._neural_model = neural_model
+        self._neural_model_path = neural_model_path
+        self._neural_model = PPO.load(neural_model_path)
 
         self._terminal_ingredients = terminal_ingredients
         self._pose = None
@@ -51,6 +56,18 @@ class EPSF_Controller:
         self._U_plan = None
         self._prev_cmd = None
 
+
+
+    def get_parameters(self):
+        return {
+            "horizon": self._N,
+            "neural_model_path": self._neural_model_path,
+            "control_frequency": 1 / self._dt,
+            "R": self._R,
+            "Q": self._Q,
+            "diff_R": self._diff_R,
+            "PR": self._PR,
+        }
 
 
     def set_target_velocities(self, target_velocities):
@@ -228,12 +245,12 @@ class EPSF_Controller:
             weight *= self.provide_weight_from_geodesic_dist(X[:, k+1], x_ref[k])
 
             cost += weight * (diff_cmd.T @ self._R @ diff_cmd)
-            cost += (1-weight) * ((state_error.T @ self._Q @ state_error)) #+ U[:, k].T @ self._diff_R @ U[:, k])
+            cost += (1-weight) * ((state_error.T @ self._Q @ state_error) + U[:, k].T @ self._diff_R @ U[:, k])
 
         for k in range(1, h):
 
             diff = U[:,k] - U[:,k-1] 
-            cost += ca.mtimes([diff.T, 0.5 * ca.DM(self._diff_R), diff])
+            cost += ca.mtimes([diff.T, ca.DM(self._diff_R), diff])
 
         # inequality constraints : bornes
         u_min = self._bounds["u_min"]

@@ -1,5 +1,7 @@
 import numpy as np
 import casadi as ca
+from scipy.spatial import ConvexHull
+from stable_baselines3 import PPO
 
 
 class PSF_MC_Controller:
@@ -8,26 +10,28 @@ class PSF_MC_Controller:
                 dynamics,
                 horizon : int,
                 control_frequency : float,
-                neural_model,
+                neural_model_path,
                 bounds : dict,
                 R: np.ndarray,
+                obstacles = [],
                 terminal_ingredients=None):
 
         self._N = horizon
         self._dt = 1 / control_frequency
 
         self._R = R
-
+        self._neural_model_path = neural_model_path
+        self._neural_model = PPO.load(neural_model_path)
         self._bounds = bounds
 
-        self._n_x = 4
+        self._obstacles = obstacles
+
+        self._n_x = 5
         self._n_u = 2
 
-        self.gamma = 0.95
+        self.discount_factor = 0.95
 
         self._dynamics = dynamics
-
-        self._neural_model = neural_model
 
         self.X = ca.MX.sym('X', self._n_x, self._N+1)
         self.U = ca.MX.sym('U', self._n_u, self._N)
@@ -41,23 +45,34 @@ class PSF_MC_Controller:
         self._target_velocities = None
         self.neural_states = None
 
+        self._kbar = 0
+        self._k = 0
+        self._X_plan = None
+        self._U_plan = None
+
         self.episode_start = True
 
 
     def set_target_velocities(self, target_velocities):
         self._target_velocities = target_velocities
 
-    
     def set_target_pose(self, target_pose):
         self._target_pose = target_pose
 
+    def set_target_vector(self, target_vector):
+        self._target_vector = target_vector
 
     def set_current_pose(self, pose):
         self._pose = pose
 
-
     def set_current_velocities(self, velocities):
         self._velocities = velocities
+
+    def set_gamma(self, gamma):
+        self._gamma = gamma
+
+    def set_obstacles(self, obstacles):
+        self.obstacles = obstacles
 
 
     def rk4_step(self, x, u):
@@ -68,158 +83,127 @@ class PSF_MC_Controller:
         return x + self._dt/6*(k1 + 2*k2 + 2*k3 + k4)
 
 
-    # def _compute_agent_vect(self, action):
-    #     """
-    #     Returns a vector describing:
-    #     - distance to target (rho)
-    #     - direction to target (alpha)
-    #     - orientation error (delta_yaw)
-    #     - error in forward speed
-    #     - error in angular velocity
-    #     """
 
-    #     v_ref, gamma = action
-    #     prev_v_ref, prev_gamma = self._previous_action
-
-    #     diff_v_ref = v_ref - prev_v_ref
-    #     diff_gamma = gamma - prev_gamma
-
-    #     # Agent state
-    #     pose_x, pose_y, pose_yaw = self._pose
-    #     lin_vel, lat_vel, ang_vel = self._velocities
-
-    #     # Target state
-    #     target_x, target_y, target_yaw = self._target_pose
-    #     target_lin_vel, target_ang_vel = self._target_velocities
+    def get_parameters(self):
+        return {
+            "controller_type ": "PSF_MC",
+            "horizon": self._N,
+            "neural_model_path": self._neural_model_path,
+            "control_frequency": 1 / self._dt,
+            "R": self._R,
+        }
 
 
-    #     dx = target_x - pose_x
-    #     dy = target_y - pose_y
+    def obstacle_to_ellipse(self, points: np.ndarray, safety_radius: float = 1.0):
 
-    #     #forward error in agent space
-    #     forward_error =  np.cos(pose_yaw) * dx + np.sin(pose_yaw) * dy
+        assert points.shape[1] == 2, "Les points doivent être en 2D"
 
-    #     lateral_error = -np.sin(pose_yaw) * dx + np.cos(pose_yaw) * dy
-        
-    #     #orientation error
-    #     delta_yaw = (target_yaw - pose_yaw + np.pi) % (2 * np.pi) - np.pi
+        hull = ConvexHull(points)
+        hull_pts = points[hull.vertices]
 
-    #     target_vel_robot_frame = np.array([
-    #         target_lin_vel * np.cos(target_yaw - pose_yaw),
-    #         target_lin_vel * np.sin(target_yaw - pose_yaw)
-    #     ])
+        center = np.mean(hull_pts, axis=0)
 
-    #     vel_error_x = target_vel_robot_frame[0] - lin_vel
-    #     vel_error_y = target_vel_robot_frame[1] - lat_vel
+        distances = np.linalg.norm(hull_pts - center, axis=1)
+        max_dist = np.max(distances)
 
-    #     ang_vel_error = target_ang_vel - ang_vel
-    
-    #     agent_state_vect = np.array([
-    #         forward_error,
-    #         lateral_error,
-    #         delta_yaw,
-    #         vel_error_x,
-    #         vel_error_y,
-    #         ang_vel_error,
-    #         gamma,
-    #         v_ref
-    #     ])
+        radius = max_dist + safety_radius
 
-    #     return agent_state_vect
+        return {
+            'center': center,
+            'radius': radius
+        }
 
-    def _compute_agent_vect(self, action):
 
+    def _compute_agent_vect(self, target_states, state):
         """
-        Returns a vector describing:
-        - distance to target (rho)
-        - direction to target (alpha)
-        - orientation error (delta_yaw)
+        Returns a vector describing the agent state relative to the *entire target sequence*:
+        - forward and lateral error for each target
+        - orientation error for each target
         - error in forward speed
         - error in angular velocity
         """
 
-        # Agent state
-        pose_x, pose_y, pose_yaw = self._pose
-        lin_vel, ang_vel = self._velocities
+        agent_state_vect = []
 
-        # Target state
-        target_x, target_y, target_yaw = self._target_pose
-        target_lin_vel, target_ang_vel = self._target_velocities
+        # Iterate over the target sequence
+        for i in range(self._N):
+            target_state = target_states[:, i]  # assuming you store the whole sequence in self._target_sequence
+            target_lin_vel, target_ang_vel = target_state[0:2]
+            target_x, target_y, target_yaw = target_state[2:5]
 
+            pose_x, pose_y, pose_yaw = state[0:3]
+            pose_yaw = (pose_yaw + np.pi) % (2 * np.pi) - np.pi  # Normalize to [-pi, pi]
+            lin_vel, ang_vel = self.get_velocities_from_cmd(state[3:5])
+            current_gamma = self._gamma
 
-        dx = target_x - pose_x
-        dy = target_y - pose_y
+            dx = target_x - pose_x
+            dy = target_y - pose_y
 
-        #forward error in agent space
-        forward_error =  np.cos(pose_yaw) * dx + np.sin(pose_yaw) * dy
-        # if np.abs(forward_error) > 20.0:
-        #     forward_error = np.sign(forward_error) * 20.0
+            # Forward/lateral error in agent frame
+            forward_error = np.cos(pose_yaw) * dx + np.sin(pose_yaw) * dy
+            lateral_error = -np.sin(pose_yaw) * dx + np.cos(pose_yaw) * dy
 
-        #lateral error encoded as an angle
-        # angle_error = np.arctan2(
-        #     -np.sin(pose_yaw) * dx + np.cos(pose_yaw) * dy,
-        #     np.cos(pose_yaw) * dx + np.sin(pose_yaw) * dy
-        # )
-        lateral_error = -np.sin(pose_yaw) * dx + np.cos(pose_yaw) * dy
-        
-        #orientation error
-        delta_yaw = (target_yaw - pose_yaw + np.pi) % (2 * np.pi) - np.pi
+            # Orientation error
+            delta_yaw = (target_yaw - pose_yaw + np.pi) % (2 * np.pi) - np.pi
 
-        target_vel_robot_frame = np.array([
-            target_lin_vel * np.cos(target_yaw - pose_yaw),
-            target_lin_vel * np.sin(target_yaw - pose_yaw)
-        ])
+            # Velocity error in robot frame
+            target_vel_robot_frame = np.array([
+                target_lin_vel * np.cos(target_yaw - pose_yaw),
+                target_lin_vel * np.sin(target_yaw - pose_yaw)
+            ])
+            vel_error_x = target_vel_robot_frame[0] - lin_vel
+            ang_vel_error = target_ang_vel - ang_vel
 
-        vel_error_x = target_vel_robot_frame[0] - lin_vel
+            # Gamma error
+            if np.abs(target_ang_vel) < 1e-2 or np.abs(target_lin_vel) < 1e-2:
+                target_gamma = 0.0
+            else:
+                ratio = np.clip((4 * target_ang_vel) / (2 * target_lin_vel), -1.0, 1.0)
+                target_gamma = 2 * np.arcsin(ratio)
 
-        ang_vel_error = target_ang_vel - ang_vel
+            gamma_error = (target_gamma - current_gamma + np.pi) % (2 * np.pi) - np.pi
 
-        current_gamma = self._X_k['gamma']
-        if np.abs(target_ang_vel) < 1e-2 or np.abs(target_lin_vel) < 1e-2: 
-            target_gamma = 0.0
-        else :  
-            ratio = np.clip((4 * target_ang_vel) / (2 * target_lin_vel), -1.0, 1.0)
-            target_gamma = 2 * np.arcsin(ratio)
+            # Append all errors for this target to the vector
+            agent_state_vect.extend([
+                forward_error,
+                lateral_error,
+                delta_yaw,
+                vel_error_x,
+                gamma_error,
+            ])
 
-        gamma_error = target_gamma - current_gamma
-        gamma_error = (gamma_error + np.pi) % (2 * np.pi) - np.pi
-
-        agent_state_vect = np.array([
-            forward_error,
-            lateral_error,
-            delta_yaw,
-            vel_error_x,
-            gamma_error,
-        ])
-
-        return agent_state_vect
+        return np.array(agent_state_vect)       
 
 
     def get_neural_prediction(self, obs) :
 
         obs = np.array(obs).reshape(1, -1)
-        action, self.neural_states = self._neural_model.predict(
+        action, _ = self._neural_model.predict(
             obs,
-            state=self.neural_states,
-            episode_start=np.array([self.episode_start]),
             deterministic=True
         )
         self.episode_start = False
         return action.tolist()
 
 
-    def build_nlp(self, x_init, u_ref):
+    def build_nlp(self, x_init, u_ref, h):
 
+
+        nx, nu = self._n_x, self._n_u
+        X = ca.MX.sym('X', nx, h+1)
+        U = ca.MX.sym('U', nu, h)
+        Z = ca.MX.sym('Z', nx, h+1)
 
         cost = 0
         g_equalities = []
         g_ineq = []
 
 
-        for k in range(self._N):
+        for k in range(h) :
 
-            d_f = self.gamma**k
-            command_error = self.U[:, k] - u_ref[:, k]
+            u_ref_k = np.array([u_ref[2*k], u_ref[2*k + 1]])
+            d_f = self.discount_factor**k
+            command_error = U[:, k] - u_ref_k
             cost += d_f * ca.mtimes([command_error.T, self._R, command_error])
 
 
@@ -227,7 +211,7 @@ class PSF_MC_Controller:
         if self._terminal_ingredients is not None:
 
             P = self._terminal_ingredients["P"]
-            state_error_terminal = self.X[:, self._N] - x_ref[:, int(self._N)]
+            state_error_terminal = X[:, self._N] - x_ref[:, int(self._N)]
             alpha = float(self._terminal_ingredients["alpha"])
             quad = ca.mtimes([state_error_terminal.T, ca.DM(P), state_error_terminal])
             g_ineq += [quad - alpha]
@@ -239,14 +223,12 @@ class PSF_MC_Controller:
 
         # equality constraints : dynamique
 
-        for k in range(self._N):
-            x_next_pred = self.rk4_step(self.X[:, k], self.U[:, k])
-            g_equalities.append(self.X[:, k+1] - x_next_pred)
+        for k in range(h):
+            x_next_pred = self.rk4_step(X[:, k], U[:, k])
+            g_equalities.append(X[:, k+1] - x_next_pred)
 
         # initial condition
-        g_equalities.append(self.X[:,0] - x_init)
-        g_equalities = ca.vertcat(*g_equalities)
-
+        g_equalities.append(X[:,0] - x_init)
         # inequality constraints : bornes
         u_min = self._bounds["u_min"]
         u_max = self._bounds["u_max"]
@@ -254,31 +236,53 @@ class PSF_MC_Controller:
         x_max = self._bounds["x_max"]
 
 
-        for k in range(self._N):
+        for k in range(h):
 
             for i in range(self._n_u):
-                g_ineq += [u_min[i] - self.U[i, k]]
-                g_ineq += [self.U[i, k] - u_max[i]]
+                g_ineq += [u_min[i] - U[i, k]]
+                g_ineq += [U[i, k] - u_max[i]]
 
 
             for i in range(self._n_x):
-                g_ineq += [x_min[i] - self.X[i, k+1]]
-                g_ineq += [self.X[i, k+1] - x_max[i]]
-
-        g_ineq = ca.vertcat(*g_ineq)
+                g_ineq += [x_min[i] - X[i, k+1]]
+                g_ineq += [X[i, k+1] - x_max[i]]
 
 
-        opt_vars = ca.vertcat(ca.reshape(self.X, -1, 1),
-                              ca.reshape(self.U, -1, 1),
-                              ca.reshape(self.Z, -1, 1))
+        for obstacle in self.obstacles:
+            ellipse = self.obstacle_to_ellipse(obstacle, safety_radius=1.0)
+            center = ellipse['center']
+            radius = ellipse['radius']
+
+            for k in range(h):
+                dist_sq = (X[0, k] - center[0])**2 + (X[1, k] - center[1])**2
+                g_ineq += [radius**2 - dist_sq]
+
+            dist_sq_final = (X[0, h] - center[0])**2 + (X[1, h] - center[1])**2
+            g_ineq += [radius**2 - dist_sq_final]
+
+        g_equalities.append(X[:,0] - x_init)
+        g_equalities = ca.vertcat(*g_equalities)
+        g_ineq = ca.vertcat(*g_ineq)        
+
+        opt_vars = ca.vertcat(ca.reshape(X, -1, 1),
+                              ca.reshape(U, -1, 1))
 
         nlp = {'x': opt_vars, 'f': cost, 'g': ca.vertcat(g_equalities, g_ineq)}
-        return nlp, g_equalities, g_ineq
+
+        sizes = {
+            'nx_block': self._n_x*(h+1),
+            'nu_block': self._n_u*h,
+            'g_eq_len': g_equalities.numel(),
+            'g_ineq_len': g_ineq.numel(),
+            'horizon': h
+        }
+
+        return nlp, sizes, g_equalities, g_ineq
 
 
-    def solve(self, x_init, u_ref):
 
-        nlp, g, g_ineq = self.build_nlp(x_init, u_ref)
+
+    def solve_nlp(self, nlp, sizes, u_ref, x_init) : 
 
         opts = {
             "ipopt.print_level": 0,
@@ -286,69 +290,99 @@ class PSF_MC_Controller:
             "ipopt.sb": "yes",
         }
 
-        solver = ca.nlpsol('solver', 'ipopt', nlp)
+        solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
 
-        lbg = [0]*g.numel() + [-ca.inf]*g_ineq.numel()
-        ubg = [0]*g.numel() + [0]*g_ineq.numel()
+        g_eq = sizes['g_eq_len']
+        g_ineq = sizes['g_ineq_len']
+        horizon = sizes['horizon']
 
-        X0 = np.tile(x_init.reshape(-1,1), (1, self._N+1))
-        U0 = np.zeros((self._n_u, self._N))
-        Z0 = np.zeros((self._n_x, self._N+1))
+        lbg = [0]*g_eq + [-ca.inf]*g_ineq
+        ubg = [0]*g_eq + [0]*g_ineq
 
+        X0 = np.tile(x_init.reshape(-1,1), (horizon+1))
+    
+        U0 = np.zeros((self._n_u, horizon))
+        for k in range(horizon):
+            u_ref_k = np.array([u_ref[2*k], u_ref[2*k + 1]])
+            U0[:,k] = u_ref_k
+
+    
         x_init_tile = X0.flatten(order='F')
         u_init_tile = U0.flatten(order='F')
-        z_init_tile = Z0.flatten(order='F')
 
-        initial_guess = np.concatenate([x_init_tile, u_init_tile, z_init_tile])
+        initial_guess = np.concatenate([x_init_tile, u_init_tile])
 
         sol = solver(x0=initial_guess, lbg=lbg, ubg=ubg)
-        w_opt = np.array(sol['x']).squeeze()
 
-        X_opt = w_opt[:self._n_x*(self._N+1)].reshape((self._n_x, self._N+1), order='F')
-        U_opt = w_opt[self._n_x*(self._N+1):self._n_x*(self._N+1)+self._n_u*self._N].reshape((self._n_u, self._N), order='F')
+        stats = solver.stats()
+
+        if not stats['success']:
+            print("NLP solver failed")
+            return None, None   
+
+        else : 
+            w_opt = np.array(sol['x']).squeeze()
+            X_opt = w_opt[:self._n_x*(horizon+1)].reshape((self._n_x, horizon+1), order='F')
+            U_opt = w_opt[self._n_x*(horizon+1):self._n_x*(horizon+1)+self._n_u*horizon].reshape((self._n_u, horizon), order='F')
+
+            return X_opt, U_opt
+
+
+    
+    def solve_global_problem(self, x_init, u_rl) :
+
+        nlp, sizes, g_equalities, g_ineq = self.build_nlp(x_init, u_rl, self._N)
+        X_opt, U_opt = self.solve_nlp(nlp, sizes, u_rl, x_init)
+
+        if X_opt is not None and U_opt is not None:
+            self._kbar = self._k
+            return X_opt, U_opt
+
+        else : 
+            if self._k < self._kbar + self._N:
+                dt = self._k - self._kbar
+                reduced_horizon = self._N - dt
+                x_rl = x_rl[:reduced_horizon]
+                u_rl = u_rl[:2*reduced_horizon + 1]
+
+                nlp_red, sizes_red, g_eq_red, g_ineq_red = self.build_nlp(
+                    x_init, x_rl, u_rl, reduced_horizon)
+                X_red, U_red = self.solve_nlp(nlp_red, sizes_red, u_rl, x_init, x_rl)
+
+                if X_red is not None and U_red is not None:
+                    return X_red, U_red
+
+        X_opt = x_init.reshape(-1, 1).repeat(self._N, axis=1)
+
+        u_opt = [0.0, 0.0]
+        U_opt = np.array(u_opt).reshape(-1, 1).repeat(self._N, axis=1)
 
         return X_opt, U_opt
 
 
-    def act(self, x_target, u_target) :
 
-        u_ref = np.zeros((2, horizon + 1))
+    def get_velocities_from_cmd(self, u_cmd) :
+        v_ref, gamma = u_cmd
+        return np.array([v_ref, 2 * v_ref * np.sin(gamma / 2) / 4])
 
-        # step 0 : compute agent_vect from current state and target
-        obs = self._compute_agent_vect(self._previous_action)
-        u_init = self.get_neural_prediction(obs)[0]
-        v_ref, gamma = u_init
-        u_ref[:,0] = [v_ref, (gamma - self._previous_action[1]) / self._dt]
 
-        for k in range(1, self._N):
 
-            gamma_dot = (gamma - self._previous_action[1]) / self._dt
-            u = [v_ref, gamma_dot]
-            
-            #simulate next state
+    def act(self, x_init) :
 
-            x_dot = self._dynamics(x_init, u)
-            x_init = self.rk4_step(x_init, u)
-            
-            x_dot, y_dot, theta_dot, gamma_dot = x_dot
-            x, y, theta, gamma = x_init
-            self._pose = [x, y, theta]
-            self._velocities = [x_dot, theta_dot]
-            self._target_velocities =  u_target[:, k]
-            self._target_pose = x_target[:, k]
+        obs = self._compute_agent_vect(target_states=self._target_vector, state=x_init)
+        u_rl = self.get_neural_prediction(obs)[0]
+        #x_rl = self.get_neural_prediction_states(u_rl, x_init)
 
-            self._previous_action = [v_ref, gamma]
-            obs = self._compute_agent_vect(self._previous_action)
-            u_init = self.get_neural_prediction(obs)[0]
-            
-            v_ref, gamma = u_init
-            u_ref[:, k] = [v_ref, (gamma - self._previous_action[1]) / self._dt]
-
-        X_opt, U_opt = self.solve(x_init, u_ref)
+        X_opt, U_opt = self.solve_global_problem(x_init, u_rl)
+        U_opt_list = []
+        for i in range(U_opt.shape[1]):
+            U_opt_list.append(U_opt[0, i])
+            U_opt_list.append(U_opt[1, i])
         opt_cmd = U_opt[:, 0]
 
-        return opt_cmd
-        
+        return opt_cmd, X_opt, u_rl, U_opt_list
+
+
 
 
 if __name__ == "__main__":
